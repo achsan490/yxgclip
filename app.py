@@ -27,7 +27,17 @@ YDL_EXTRACTOR_ARGS = {
     }
 }
 
-def get_ydl_opts(extra: dict = None, cookiefile: str = None) -> dict:
+class YtDlpLogger(object):
+    def __init__(self):
+        self.logs = []
+    def debug(self, msg):
+        self.logs.append(f"[DEBUG] {msg}")
+    def warning(self, msg):
+        self.logs.append(f"[WARNING] {msg}")
+    def error(self, msg):
+        self.logs.append(f"[ERROR] {msg}")
+
+def get_ydl_opts(extra: dict = None, cookiefile: str = None, logger = None) -> dict:
     """Buat yt-dlp options dengan cookies (jika ada) untuk bypass 403."""
     opts = {
         'quiet': True,
@@ -37,6 +47,10 @@ def get_ydl_opts(extra: dict = None, cookiefile: str = None) -> dict:
         'socket_timeout': 30,
         'retries': 5,
     }
+    if logger:
+        opts['logger'] = logger
+        opts['quiet'] = False
+        opts['no_warnings'] = False
     if cookiefile and os.path.exists(cookiefile):
         opts['cookiefile'] = cookiefile
         
@@ -571,7 +585,8 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    ydl_opts = get_ydl_opts({'skip_download': True}, cookiefile=COOKIE_FILE_PATH)
+    logger = YtDlpLogger()
+    ydl_opts = get_ydl_opts({'skip_download': True}, cookiefile=COOKIE_FILE_PATH, logger=logger)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -610,7 +625,8 @@ def get_metadata(url):
                 'sub_langs': available_sub_langs,
             }
         except Exception as e:
-            return {'status': 'error', 'message': str(e)}
+            log_str = "\n".join(logger.logs)
+            return {'status': 'error', 'message': f"{str(e)}\n\nLogs:\n{log_str}"}
 
 
 def parse_heatmap_peaks(heatmap_data, duration, max_clips=6, min_clip_dur=15, max_clip_dur=60):
@@ -1333,11 +1349,12 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
 
     # Download full video jika belum ada
     if not os.path.exists(full_video_path):
+        logger = YtDlpLogger()
         ydl_opts = get_ydl_opts({
             'format': fmt_map.get(quality, fmt_map["480p"]),
             'outtmpl': full_video_path,
             'merge_output_format': 'mp4',
-        }, cookiefile=COOKIE_FILE_PATH)
+        }, cookiefile=COOKIE_FILE_PATH, logger=logger)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -1348,12 +1365,19 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
                 'format': 'best',  # Progressive format (biasanya 360p atau 720p)
                 'outtmpl': full_video_path,
                 'merge_output_format': 'mp4',
-            }, cookiefile=COOKIE_FILE_PATH)
+            }, cookiefile=COOKIE_FILE_PATH, logger=logger)
             try:
                 with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
                     ydl_fb.download([url])
             except Exception as fb_err:
-                raise Exception(f"Gagal mendownload video (keduanya gagal). Error asli: {str(e)}. Error fallback: {str(fb_err)}")
+                log_str = "\n".join(logger.logs)
+                raise Exception(
+                    f"Gagal mendownload video (keduanya gagal).\n"
+                    f"Error asli: {str(e)}.\n"
+                    f"Error fallback: {str(fb_err)}.\n"
+                    f"Cookies active: {bool(COOKIE_FILE_PATH)}.\n"
+                    f"Yt-Dlp Logs:\n{log_str}"
+                )
 
     if not os.path.exists(full_video_path):
         raise Exception("Gagal mendownload video.")
