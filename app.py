@@ -1344,8 +1344,22 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
             'outtmpl': full_video_path,
             'merge_output_format': 'mp4',
         }, cookiefile=COOKIE_FILE_PATH)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            # Fallback jika gagal (misal 403 Forbidden di format DASH):
+            # Coba download format progressive (single file video+audio) yang lebih longgar proteksinya
+            fallback_opts = get_ydl_opts({
+                'format': 'best',  # Progressive format (biasanya 360p atau 720p)
+                'outtmpl': full_video_path,
+                'merge_output_format': 'mp4',
+            }, cookiefile=COOKIE_FILE_PATH)
+            try:
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
+                    ydl_fb.download([url])
+            except Exception as fb_err:
+                raise Exception(f"Gagal mendownload video (keduanya gagal). Error asli: {str(e)}. Error fallback: {str(fb_err)}")
 
     if not os.path.exists(full_video_path):
         raise Exception("Gagal mendownload video.")
