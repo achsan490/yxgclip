@@ -1635,18 +1635,27 @@ with st.sidebar:
         type=["txt"],
         help="Export cookies YouTube dari browser pakai ekstensi 'Get cookies.txt LOCALLY', lalu upload di sini."
     )
-    COOKIE_FILE_PATH = None
+
+    # Path permanen cookie di disk
+    _cookie_save_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
+
     if uploaded_cookie:
-        cookie_save_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
+        # User baru upload — simpan ke disk
         try:
-            with open(cookie_save_path, "wb") as f:
+            with open(_cookie_save_path, "wb") as f:
                 f.write(uploaded_cookie.getbuffer())
-            COOKIE_FILE_PATH = cookie_save_path
+            COOKIE_FILE_PATH = _cookie_save_path
             st.success("✅ Cookies aktif!")
         except Exception:
+            COOKIE_FILE_PATH = None
             st.error("Gagal menyimpan cookies.")
+    elif os.path.exists(_cookie_save_path):
+        # File cookies sudah ada dari upload sebelumnya — gunakan langsung
+        COOKIE_FILE_PATH = _cookie_save_path
+        st.success("✅ Cookies aktif (tersimpan)!")
     else:
-        st.info("💡 Tanpa cookies, download mungkin gagal (403) di Streamlit Cloud.")
+        COOKIE_FILE_PATH = None
+        st.warning("⚠️ Upload cookies.txt agar download tidak gagal 403.")
 
     st.markdown("---")
     st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit · yt-dlp · FFmpeg</div></div>', unsafe_allow_html=True)
