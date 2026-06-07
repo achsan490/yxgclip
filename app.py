@@ -1305,16 +1305,49 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
     }
 
     # Download full video jika belum ada
+    lock_path = full_video_path + ".lock"
+    
+    # Jika lock file sangat lama (lebih dari 10 menit), hapus (asumsi sisa crash sebelumnya)
+    if os.path.exists(lock_path):
+        import time
+        try:
+            mtime = os.path.getmtime(lock_path)
+            if time.time() - mtime > 600:
+                os.remove(lock_path)
+        except Exception:
+            pass
+
+    # Tunggu jika thread/proses lain sedang mendownload video ini
+    if os.path.exists(lock_path):
+        import time
+        start_wait = time.time()
+        with st.spinner("⏳ Menunggu unduhan video selesai di proses lain..."):
+            while os.path.exists(lock_path):
+                time.sleep(1)
+                # Maksimal tunggu 5 menit
+                if time.time() - start_wait > 300:
+                    break
+
     if not os.path.exists(full_video_path):
-        ydl_opts = {
-            'format': fmt_map.get(quality, fmt_map["480p"]),
-            'outtmpl': full_video_path,
-            'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # Buat lock file untuk mencegah race condition
+        try:
+            with open(lock_path, "w") as f:
+                f.write("locked")
+                
+            ydl_opts = {
+                'format': fmt_map.get(quality, fmt_map["480p"]),
+                'outtmpl': full_video_path,
+                'merge_output_format': 'mp4',
+                'quiet': True,
+                'no_warnings': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        finally:
+            # Hapus lock file setelah selesai/gagal
+            if os.path.exists(lock_path):
+                try: os.remove(lock_path)
+                except Exception: pass
 
     if not os.path.exists(full_video_path):
         raise Exception("Gagal mendownload video.")
