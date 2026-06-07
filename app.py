@@ -1324,10 +1324,11 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
         except Exception: pass
 
     fmt_map = {
-        "360p": 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best',
-        "480p": 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best',
-        "720p": 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
-        "1080p": 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best',
+        # Prioritas: video+audio terpisah → gabung ffmpeg. Fallback ke format apapun yang ada.
+        "360p": 'bestvideo[height<=360]+bestaudio/bestvideo[height<=360]/best[height<=360]/best',
+        "480p": 'bestvideo[height<=480]+bestaudio/bestvideo[height<=480]/best[height<=480]/best',
+        "720p": 'bestvideo[height<=720]+bestaudio/bestvideo[height<=720]/best[height<=720]/best',
+        "1080p": 'bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]/best[height<=1080]/best',
     }
 
     # Download full video jika belum ada
