@@ -17,7 +17,7 @@ import time
 import glob
 import subprocess
 import shutil
-from yt_dlp.utils import download_range_func
+from yt_dlp.utils import download_range_func  # kept for potential future use
 
 # Whisper untuk generate subtitle lokal (fallback jika YouTube tidak punya caption)
 WHISPER_TYPE = None
@@ -1283,33 +1283,58 @@ def slice_srt(srt_path, start_sec, end_sec, output_path):
 
 
 def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
-    """Download hanya rentang waktu tertentu dari video (tanpa download penuh)."""
+    """
+    Download clip dari YouTube dan potong sesuai rentang waktu.
+    Strategi: download full video dulu, lalu potong lokal dengan ffmpeg.
+    Ini lebih stabil di cloud environment (Streamlit Cloud) dibanding
+    partial download yang membutuhkan ffmpeg sebagai external downloader.
+    """
     ts = f"{int(start_sec)}_{int(end_sec)}"
     output_path = os.path.join(DOWNLOADS_DIR, f"raw_{video_id}_{ts}.mp4")
+    full_video_path = os.path.join(DOWNLOADS_DIR, f"full_{video_id}.mp4")
 
     if os.path.exists(output_path):
         try: os.remove(output_path)
         except Exception: pass
 
     fmt_map = {
-        "360p": 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]/best',
-        "480p": 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]/best',
-        "720p": 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best',
-        "1080p": 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best',
+        "360p": 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best',
+        "480p": 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best',
+        "720p": 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+        "1080p": 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best',
     }
 
-    ydl_opts = {
-        'format': fmt_map.get(quality, fmt_map["480p"]),
-        'outtmpl': output_path,
-        'download_ranges': download_range_func(None, [(start_sec, end_sec)]),
-        'force_keyframes_at_cuts': True,
-        'merge_output_format': 'mp4',
-        'external_downloader': 'ffmpeg',
-        'quiet': True, 'no_warnings': True,
-    }
+    # Download full video jika belum ada
+    if not os.path.exists(full_video_path):
+        ydl_opts = {
+            'format': fmt_map.get(quality, fmt_map["480p"]),
+            'outtmpl': full_video_path,
+            'merge_output_format': 'mp4',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    if not os.path.exists(full_video_path):
+        raise Exception("Gagal mendownload video.")
+
+    # Potong video dengan ffmpeg secara lokal
+    duration = end_sec - start_sec
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_sec),
+        "-i", full_video_path,
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-c:a", "aac",
+        "-avoid_negative_ts", "make_zero",
+        output_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="ignore")
+        raise Exception(f"FFmpeg gagal memotong video: {err}")
 
     return output_path
 
