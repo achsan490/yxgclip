@@ -20,20 +20,32 @@ import shutil
 from yt_dlp.utils import download_range_func  # kept for potential future use
 
 # Opsi dasar yt-dlp untuk bypass bot-detection YouTube di cloud server (403 Forbidden).
-# Android client tidak memerlukan po_token dan lebih toleran terhadap IP datacenter.
-YDL_BASE_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'web'],
-            'player_skip': ['webpage'],
-        }
-    },
-    'http_headers': {
-        'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
-    },
+# Gunakan cookies dari browser sebagai solusi paling reliable.
+YDL_EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['tv_embedded', 'ios', 'android', 'web'],
+        'player_skip': ['webpage'],
+    }
 }
+
+def get_ydl_opts(extra: dict = None, cookiefile: str = None) -> dict:
+    """Buat yt-dlp options dengan cookies (jika ada) untuk bypass 403."""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': YDL_EXTRACTOR_ARGS,
+        'geo_bypass': True,
+        'socket_timeout': 30,
+        'retries': 5,
+    }
+    if cookiefile and os.path.exists(cookiefile):
+        opts['cookiefile'] = cookiefile
+    if extra:
+        opts.update(extra)
+    return opts
+
+# Path file cookies (diupdate dari sidebar)
+COOKIE_FILE_PATH = None
 
 # Whisper untuk generate subtitle lokal (fallback jika YouTube tidak punya caption)
 WHISPER_TYPE = None
@@ -559,7 +571,7 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
+    ydl_opts = get_ydl_opts({'skip_download': True}, cookiefile=COOKIE_FILE_PATH)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -1038,8 +1050,7 @@ def download_subtitles(url, video_id, lang='id'):
         try: os.remove(old_file)
         except Exception: pass
 
-    ydl_opts = {
-        **YDL_BASE_OPTS,
+    ydl_opts = get_ydl_opts({
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -1049,7 +1060,7 @@ def download_subtitles(url, video_id, lang='id'):
             'key': 'FFmpegSubtitlesConvertor',
             'format': 'srt',
         }],
-    }
+    }, cookiefile=COOKIE_FILE_PATH)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -1321,12 +1332,11 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
 
     # Download full video jika belum ada
     if not os.path.exists(full_video_path):
-        ydl_opts = {
-            **YDL_BASE_OPTS,
+        ydl_opts = get_ydl_opts({
             'format': fmt_map.get(quality, fmt_map["480p"]),
             'outtmpl': full_video_path,
             'merge_output_format': 'mp4',
-        }
+        }, cookiefile=COOKIE_FILE_PATH)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -1616,6 +1626,27 @@ with st.sidebar:
                 sub_size = 20
                 sub_color_hex = "&H00FFFFFF"
                 sub_outline_hex = "&H00000000"
+
+    # === COOKIES YOUTUBE ===
+    st.markdown('<div class="sidebar-section-title">🍪 COOKIES YOUTUBE</div>', unsafe_allow_html=True)
+    st.caption("Wajib di-upload jika muncul error 403. Export dari browser kamu.")
+    uploaded_cookie = st.file_uploader(
+        "Upload cookies.txt",
+        type=["txt"],
+        help="Export cookies YouTube dari browser pakai ekstensi 'Get cookies.txt LOCALLY', lalu upload di sini."
+    )
+    COOKIE_FILE_PATH = None
+    if uploaded_cookie:
+        cookie_save_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
+        try:
+            with open(cookie_save_path, "wb") as f:
+                f.write(uploaded_cookie.getbuffer())
+            COOKIE_FILE_PATH = cookie_save_path
+            st.success("✅ Cookies aktif!")
+        except Exception:
+            st.error("Gagal menyimpan cookies.")
+    else:
+        st.info("💡 Tanpa cookies, download mungkin gagal (403) di Streamlit Cloud.")
 
     st.markdown("---")
     st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit · yt-dlp · FFmpeg</div></div>', unsafe_allow_html=True)
