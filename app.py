@@ -19,6 +19,22 @@ import subprocess
 import shutil
 from yt_dlp.utils import download_range_func  # kept for potential future use
 
+# Opsi dasar yt-dlp untuk bypass bot-detection YouTube di cloud server (403 Forbidden).
+# Android client tidak memerlukan po_token dan lebih toleran terhadap IP datacenter.
+YDL_BASE_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web'],
+            'player_skip': ['webpage'],
+        }
+    },
+    'http_headers': {
+        'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
+    },
+}
+
 # Whisper untuk generate subtitle lokal (fallback jika YouTube tidak punya caption)
 WHISPER_TYPE = None
 WHISPER_AVAILABLE = False
@@ -543,7 +559,7 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True}
+    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -1023,13 +1039,12 @@ def download_subtitles(url, video_id, lang='id'):
         except Exception: pass
 
     ydl_opts = {
+        **YDL_BASE_OPTS,
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': [lang],
         'outtmpl': base_name + '.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
         'postprocessors': [{
             'key': 'FFmpegSubtitlesConvertor',
             'format': 'srt',
@@ -1307,11 +1322,10 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
     # Download full video jika belum ada
     if not os.path.exists(full_video_path):
         ydl_opts = {
+            **YDL_BASE_OPTS,
             'format': fmt_map.get(quality, fmt_map["480p"]),
             'outtmpl': full_video_path,
             'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
