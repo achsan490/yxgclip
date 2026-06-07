@@ -1383,15 +1383,16 @@ def process_video_effects(input_path, output_path, format_type,
 
     # 3. Burn subtitles dari SRT / ASS
     if srt_path and os.path.exists(srt_path):
-        rel_srt = os.path.relpath(srt_path, os.getcwd()).replace("\\", "/")
-        if rel_srt.lower().endswith('.ass'):
-            sub_filter = f"subtitles='{rel_srt}'"
+        # Gunakan absolute path dan escape untuk kompatibilitas Linux & Windows
+        abs_srt = os.path.abspath(srt_path).replace("\\", "/").replace(":", "\\:")
+        if srt_path.lower().endswith('.ass'):
+            sub_filter = f"ass='{abs_srt}'"
         else:
             bold_val = "-1" if bold else "0"
             outline_val = 0 if border_style == 3 else 2
             shadow_val = 0 if border_style == 3 else 1
             sub_filter = (
-                f"subtitles='{rel_srt}'"
+                f"subtitles='{abs_srt}'"
                 f":force_style='FontSize={font_size},FontName={font_name},"
                 f"PrimaryColour={primary_color},OutlineColour={outline_color},BackColour={back_color},"
                 f"BorderStyle={border_style},Bold={bold_val},Alignment={alignment},"
@@ -1454,9 +1455,13 @@ def render_youtube_preview(video_id, start, end):
 # 7. SIDEBAR
 # ==============================================================================
 
+# Path logo yang benar — relatif terhadap file app.py, bukan working directory
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOGO_PATH = os.path.join(_APP_DIR, "logo.png")
+
 with st.sidebar:
-    if os.path.exists("logo.png"):
-        st.image("logo.png", width=95)
+    if os.path.exists(_LOGO_PATH):
+        st.image(_LOGO_PATH, width=95)
     else:
         st.markdown("""
             <div class="sidebar-brand">
@@ -1609,8 +1614,8 @@ with st.sidebar:
 # ---- HERO ----
 col_logo_l, col_logo_c, col_logo_r = st.columns([3, 2, 3])
 with col_logo_c:
-    if os.path.exists("logo.png"):
-        st.image("logo.png", use_container_width=True)
+    if os.path.exists(_LOGO_PATH):
+        st.image(_LOGO_PATH, use_container_width=True)
     else:
         st.markdown('<h1 style="text-align: center;">YXGClip</h1>', unsafe_allow_html=True)
 
