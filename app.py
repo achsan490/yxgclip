@@ -20,11 +20,10 @@ import shutil
 from yt_dlp.utils import download_range_func  # kept for potential future use
 
 # Opsi dasar yt-dlp untuk bypass bot-detection YouTube di cloud server (403 Forbidden).
-# Gunakan cookies dari browser sebagai solusi paling reliable.
+# default menggunakan web, android, ios, dll. Kita kecualikan android_sdkless karena sering diblokir 403 oleh YouTube.
 YDL_EXTRACTOR_ARGS = {
     'youtube': {
-        'player_client': ['tv_embedded', 'ios', 'android', 'web'],
-        'player_skip': ['webpage'],
+        'player_client': ['default', '-android_sdkless'],
     }
 }
 
@@ -33,18 +32,13 @@ def get_ydl_opts(extra: dict = None, cookiefile: str = None) -> dict:
     opts = {
         'quiet': True,
         'no_warnings': True,
+        'extractor_args': YDL_EXTRACTOR_ARGS,
         'geo_bypass': True,
         'socket_timeout': 30,
         'retries': 5,
     }
     if cookiefile and os.path.exists(cookiefile):
         opts['cookiefile'] = cookiefile
-        # Jika memakai cookies, biarkan extractor_args menggunakan default yt-dlp (webpage client diaktifkan)
-        # agar session cookies dari browser bisa dibaca dengan benar.
-        opts['extractor_args'] = {}
-    else:
-        # Jika tanpa cookies, gunakan custom extractor_args sebagai upaya bypass 403
-        opts['extractor_args'] = YDL_EXTRACTOR_ARGS
         
     if extra:
         opts.update(extra)
