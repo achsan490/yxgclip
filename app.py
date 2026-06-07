@@ -19,48 +19,6 @@ import subprocess
 import shutil
 from yt_dlp.utils import download_range_func  # kept for potential future use
 
-# Opsi dasar yt-dlp untuk bypass bot-detection YouTube di cloud server (403 Forbidden).
-# default menggunakan web, android, ios, dll. Kita kecualikan android_sdkless karena sering diblokir 403 oleh YouTube.
-YDL_EXTRACTOR_ARGS = {
-    'youtube': {
-        'player_client': ['default', '-android_sdkless'],
-    }
-}
-
-class YtDlpLogger(object):
-    def __init__(self):
-        self.logs = []
-    def debug(self, msg):
-        self.logs.append(f"[DEBUG] {msg}")
-    def warning(self, msg):
-        self.logs.append(f"[WARNING] {msg}")
-    def error(self, msg):
-        self.logs.append(f"[ERROR] {msg}")
-
-def get_ydl_opts(extra: dict = None, cookiefile: str = None, logger = None) -> dict:
-    """Buat yt-dlp options dengan cookies (jika ada) untuk bypass 403."""
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': YDL_EXTRACTOR_ARGS,
-        'geo_bypass': True,
-        'socket_timeout': 30,
-        'retries': 5,
-    }
-    if logger:
-        opts['logger'] = logger
-        opts['quiet'] = False
-        opts['no_warnings'] = False
-    if cookiefile and os.path.exists(cookiefile):
-        opts['cookiefile'] = cookiefile
-        
-    if extra:
-        opts.update(extra)
-    return opts
-
-# Path file cookies (diupdate dari sidebar)
-COOKIE_FILE_PATH = None
-
 # Whisper untuk generate subtitle lokal (fallback jika YouTube tidak punya caption)
 WHISPER_TYPE = None
 WHISPER_AVAILABLE = False
@@ -585,8 +543,7 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    logger = YtDlpLogger()
-    ydl_opts = get_ydl_opts({'skip_download': True}, cookiefile=COOKIE_FILE_PATH, logger=logger)
+    ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -625,8 +582,7 @@ def get_metadata(url):
                 'sub_langs': available_sub_langs,
             }
         except Exception as e:
-            log_str = "\n".join(logger.logs)
-            return {'status': 'error', 'message': f"{str(e)}\n\nLogs:\n{log_str}"}
+            return {'status': 'error', 'message': str(e)}
 
 
 def parse_heatmap_peaks(heatmap_data, duration, max_clips=6, min_clip_dur=15, max_clip_dur=60):
@@ -1066,17 +1022,19 @@ def download_subtitles(url, video_id, lang='id'):
         try: os.remove(old_file)
         except Exception: pass
 
-    ydl_opts = get_ydl_opts({
+    ydl_opts = {
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': [lang],
         'outtmpl': base_name + '.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
         'postprocessors': [{
             'key': 'FFmpegSubtitlesConvertor',
             'format': 'srt',
         }],
-    }, cookiefile=COOKIE_FILE_PATH)
+    }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -1340,44 +1298,23 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
         except Exception: pass
 
     fmt_map = {
-        # Prioritas: video+audio terpisah → gabung ffmpeg. Fallback ke format apapun yang ada.
-        "360p": 'bestvideo[height<=360]+bestaudio/bestvideo[height<=360]/best[height<=360]/best',
-        "480p": 'bestvideo[height<=480]+bestaudio/bestvideo[height<=480]/best[height<=480]/best',
-        "720p": 'bestvideo[height<=720]+bestaudio/bestvideo[height<=720]/best[height<=720]/best',
-        "1080p": 'bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]/best[height<=1080]/best',
+        "360p": 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best',
+        "480p": 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best',
+        "720p": 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+        "1080p": 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best',
     }
 
     # Download full video jika belum ada
     if not os.path.exists(full_video_path):
-        logger = YtDlpLogger()
-        ydl_opts = get_ydl_opts({
+        ydl_opts = {
             'format': fmt_map.get(quality, fmt_map["480p"]),
             'outtmpl': full_video_path,
             'merge_output_format': 'mp4',
-        }, cookiefile=COOKIE_FILE_PATH, logger=logger)
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            # Fallback jika gagal (misal 403 Forbidden di format DASH):
-            # Coba download format progressive (single file video+audio) yang lebih longgar proteksinya
-            fallback_opts = get_ydl_opts({
-                'format': 'best',  # Progressive format (biasanya 360p atau 720p)
-                'outtmpl': full_video_path,
-                'merge_output_format': 'mp4',
-            }, cookiefile=COOKIE_FILE_PATH, logger=logger)
-            try:
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
-                    ydl_fb.download([url])
-            except Exception as fb_err:
-                log_str = "\n".join(logger.logs)
-                raise Exception(
-                    f"Gagal mendownload video (keduanya gagal).\n"
-                    f"Error asli: {str(e)}.\n"
-                    f"Error fallback: {str(fb_err)}.\n"
-                    f"Cookies active: {bool(COOKIE_FILE_PATH)}.\n"
-                    f"Yt-Dlp Logs:\n{log_str}"
-                )
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
     if not os.path.exists(full_video_path):
         raise Exception("Gagal mendownload video.")
@@ -1665,36 +1602,6 @@ with st.sidebar:
                 sub_size = 20
                 sub_color_hex = "&H00FFFFFF"
                 sub_outline_hex = "&H00000000"
-
-    # === COOKIES YOUTUBE ===
-    st.markdown('<div class="sidebar-section-title">🍪 COOKIES YOUTUBE</div>', unsafe_allow_html=True)
-    st.caption("Wajib di-upload jika muncul error 403. Export dari browser kamu.")
-    uploaded_cookie = st.file_uploader(
-        "Upload cookies.txt",
-        type=["txt"],
-        help="Export cookies YouTube dari browser pakai ekstensi 'Get cookies.txt LOCALLY', lalu upload di sini."
-    )
-
-    # Path permanen cookie di disk
-    _cookie_save_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
-
-    if uploaded_cookie:
-        # User baru upload — simpan ke disk
-        try:
-            with open(_cookie_save_path, "wb") as f:
-                f.write(uploaded_cookie.getbuffer())
-            COOKIE_FILE_PATH = _cookie_save_path
-            st.success("✅ Cookies aktif!")
-        except Exception:
-            COOKIE_FILE_PATH = None
-            st.error("Gagal menyimpan cookies.")
-    elif os.path.exists(_cookie_save_path):
-        # File cookies sudah ada dari upload sebelumnya — gunakan langsung
-        COOKIE_FILE_PATH = _cookie_save_path
-        st.success("✅ Cookies aktif (tersimpan)!")
-    else:
-        COOKIE_FILE_PATH = None
-        st.warning("⚠️ Upload cookies.txt agar download tidak gagal 403.")
 
     st.markdown("---")
     st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit · yt-dlp · FFmpeg</div></div>', unsafe_allow_html=True)
