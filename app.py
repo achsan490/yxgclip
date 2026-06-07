@@ -33,13 +33,19 @@ def get_ydl_opts(extra: dict = None, cookiefile: str = None) -> dict:
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'extractor_args': YDL_EXTRACTOR_ARGS,
         'geo_bypass': True,
         'socket_timeout': 30,
         'retries': 5,
     }
     if cookiefile and os.path.exists(cookiefile):
         opts['cookiefile'] = cookiefile
+        # Jika memakai cookies, biarkan extractor_args menggunakan default yt-dlp (webpage client diaktifkan)
+        # agar session cookies dari browser bisa dibaca dengan benar.
+        opts['extractor_args'] = {}
+    else:
+        # Jika tanpa cookies, gunakan custom extractor_args sebagai upaya bypass 403
+        opts['extractor_args'] = YDL_EXTRACTOR_ARGS
+        
     if extra:
         opts.update(extra)
     return opts
