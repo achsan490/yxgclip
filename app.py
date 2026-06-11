@@ -422,6 +422,31 @@ DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
 
+# Opsi dasar yt-dlp untuk bypass bot-detection YouTube (403 Forbidden).
+# default menggunakan web, android, ios, dll. Kita kecualikan android_sdkless karena sering diblokir 403 oleh YouTube.
+YDL_EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['default', '-android_sdkless'],
+    }
+}
+
+def get_ydl_opts(extra: dict = None) -> dict:
+    """Buat yt-dlp options dengan cookies (jika ada) untuk bypass 403."""
+    cookie_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': YDL_EXTRACTOR_ARGS,
+        'geo_bypass': True,
+        'socket_timeout': 30,
+        'retries': 5,
+    }
+    if os.path.exists(cookie_path):
+        opts['cookiefile'] = cookie_path
+    if extra:
+        opts.update(extra)
+    return opts
+
 defaults = {
     'video_metadata': None,
     'current_url': "",
@@ -543,7 +568,7 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True}
+    ydl_opts = get_ydl_opts({'skip_download': True})
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -1022,7 +1047,7 @@ def download_subtitles(url, video_id, lang='id'):
         try: os.remove(old_file)
         except Exception: pass
 
-    ydl_opts = {
+    ydl_opts = get_ydl_opts({
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -1034,7 +1059,7 @@ def download_subtitles(url, video_id, lang='id'):
             'key': 'FFmpegSubtitlesConvertor',
             'format': 'srt',
         }],
-    }
+    })
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -1334,13 +1359,13 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
             with open(lock_path, "w") as f:
                 f.write("locked")
                 
-            ydl_opts = {
+            ydl_opts = get_ydl_opts({
                 'format': fmt_map.get(quality, fmt_map["480p"]),
                 'outtmpl': full_video_path,
                 'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
-            }
+            })
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         finally:
@@ -1635,6 +1660,26 @@ with st.sidebar:
                 sub_size = 20
                 sub_color_hex = "&H00FFFFFF"
                 sub_outline_hex = "&H00000000"
+
+    # === COOKIES YOUTUBE ===
+    st.markdown('<div class="sidebar-section-title">🍪 COOKIES YOUTUBE</div>', unsafe_allow_html=True)
+    st.caption("Unggah cookies.txt jika Anda menemui error 403 (Forbidden).")
+    uploaded_cookie = st.file_uploader(
+        "Unggah cookies.txt",
+        type=["txt"],
+        help="Ekspor cookies YouTube dari browser Anda menggunakan ekstensi (seperti 'Get cookies.txt LOCALLY') lalu unggah di sini."
+    )
+
+    if uploaded_cookie:
+        cookie_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
+        try:
+            with open(cookie_path, "wb") as f:
+                f.write(uploaded_cookie.getbuffer())
+            st.success("✅ Cookies aktif!")
+        except Exception:
+            st.error("Gagal menyimpan cookies.")
+    elif os.path.exists(os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")):
+        st.success("✅ Cookies aktif (tersimpan)!")
 
     st.markdown("---")
     st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit · yt-dlp · FFmpeg</div></div>', unsafe_allow_html=True)
