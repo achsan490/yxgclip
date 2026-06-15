@@ -49,3 +49,6 @@ desktop.ini
 # Environment variables
 .env
 .env.local
+
+# Streamlit secrets
+.streamlit/

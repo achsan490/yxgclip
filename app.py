@@ -19,6 +19,13 @@ import subprocess
 import shutil
 from yt_dlp.utils import download_range_func  # kept for potential future use
 
+# ==============================================================================
+# KONFIGURASI API
+# ==============================================================================
+# Mengambil API Key dari Streamlit Secrets secara aman
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+GEMINI_MODEL   = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+
 # Whisper untuk generate subtitle lokal (fallback jika YouTube tidak punya caption)
 WHISPER_TYPE = None
 WHISPER_AVAILABLE = False
@@ -422,31 +429,6 @@ DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
 
-# Opsi dasar yt-dlp untuk bypass bot-detection YouTube (403 Forbidden).
-# default menggunakan web, android, ios, dll. Kita kecualikan android_sdkless karena sering diblokir 403 oleh YouTube.
-YDL_EXTRACTOR_ARGS = {
-    'youtube': {
-        'player_client': ['default', '-android_sdkless'],
-    }
-}
-
-def get_ydl_opts(extra: dict = None) -> dict:
-    """Buat yt-dlp options dengan cookies (jika ada) untuk bypass 403."""
-    cookie_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': YDL_EXTRACTOR_ARGS,
-        'geo_bypass': True,
-        'socket_timeout': 30,
-        'retries': 5,
-    }
-    if os.path.exists(cookie_path):
-        opts['cookiefile'] = cookie_path
-    if extra:
-        opts.update(extra)
-    return opts
-
 defaults = {
     'video_metadata': None,
     'current_url': "",
@@ -461,6 +443,7 @@ defaults = {
     'clip_srt_cues': {},       # {clip_index: list of parsed cues}
     'export_running': False,
     'preview_clip_index': 0,
+    '_clips_target_dur': None, # Cache: target dur yang dipakai saat analisis terakhir
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -469,6 +452,51 @@ for k, v in defaults.items():
 # ==============================================================================
 # 4. UTILITY FUNCTIONS
 # ==============================================================================
+
+def generate_social_suggestions(clip, meta, srt_content=None):
+    """Menghasilkan saran caption/judul dan hashtag untuk media sosial (TikTok, Reels, Shorts)."""
+    import re
+    orig_title = meta.get('title', '')
+    
+    # Ekstrak kata-kata menarik dari subtitle untuk dijadikan hook
+    hook_text = ""
+    if srt_content:
+        cues = parse_srt_content(srt_content)
+        hook_words = []
+        for c in cues[:3]:  # Ambil 3 baris pertama
+            text = c.get('text', '').strip()
+            # Hapus tag ASS jika ada (misalnya {\k50})
+            text_clean = re.sub(r'\{[^}]+\}', '', text)
+            text_clean = text_clean.replace('\n', ' ')
+            if text_clean:
+                hook_words.append(text_clean)
+        if hook_words:
+            hook_text = " ".join(hook_words)
+            if len(hook_text) > 60:
+                hook_text = hook_text[:57] + "..."
+
+    clip_name = clip.get('title', '').replace('🔥 ', '').replace('📖 ', '').replace('✂️ ', '')
+    
+    if hook_text:
+        caption = f"\"{hook_text}\" 🎬 | Momen menarik dari: {orig_title}"
+    else:
+        caption = f"{clip_name} - {orig_title}"
+        
+    if len(caption) > 120:
+        caption = caption[:117] + "..."
+        
+    # Generate Hashtags
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', orig_title.lower())
+    stopwords = {'dengan', 'yang', 'untuk', 'pada', 'dari', 'bisa', 'akan', 'oleh', 'saja', 'juga', 'dalam', 'atau', 'video', 'youtube', 'clip', 'clipper'}
+    custom_tags = []
+    for w in words:
+        if w not in stopwords and len(custom_tags) < 3:
+            custom_tags.append(f"#{w}")
+            
+    default_tags = ["#fyp", "#viral", "#shorts", "#trending", "#yxgclip"]
+    all_tags = " ".join(default_tags + custom_tags)
+    
+    return caption, all_tags
 
 def fmt_time(seconds):
     """Format detik → MM:SS"""
@@ -568,7 +596,16 @@ def build_srt_content(cues):
 
 def get_metadata(url):
     """Mengambil seluruh metadata video: info dasar, chapters, heatmap, dan subtitle yang tersedia."""
-    ydl_opts = get_ydl_opts({'skip_download': True})
+    ydl_opts = {
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'android'],
+            }
+        }
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -679,6 +716,407 @@ def parse_heatmap_peaks(heatmap_data, duration, max_clips=6, min_clip_dur=15, ma
     return result
 
 
+def analyze_transcript_highlights(srt_path, duration, max_clips=4, window_sec=45, step_sec=10, min_clip_dur=20, max_clip_dur=60):
+    """
+    Layer 3 — Sliding window analysis pada subtitle/transcript untuk menemukan momen viral.
+    Menghitung skor berdasarkan: kepadatan kata emosional, tanda baca, kecepatan bicara,
+    dan ratio huruf kapital. Dijalankan jika chapters + heatmap belum cukup menghasilkan clip.
+    """
+    if not srt_path or not os.path.exists(srt_path):
+        return []
+    try:
+        with open(srt_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception:
+        return []
+
+    cues = parse_srt_content(content)
+    if not cues or len(cues) < 3:
+        return []
+
+    # Parse timestamp tiap cue ke format detik
+    timed_cues = []
+    for cue in cues:
+        parts = cue['time_line'].split(' --> ')
+        if len(parts) != 2:
+            continue
+        try:
+            start = parse_srt_time(parts[0])
+            end = parse_srt_time(parts[1])
+            text = cue['text'].replace('\n', ' ').strip()
+            timed_cues.append({'start': start, 'end': end, 'text': text})
+        except Exception:
+            continue
+
+    if not timed_cues:
+        return []
+
+    # Daftar kata kunci emosional/viral (Indonesia + English)
+    emotional_words = [
+        "rahasia", "tips", "trik", "penting", "menarik", "lucu", "ngakak", "keren",
+        "parah", "gokil", "anjir", "gila", "hebat", "kaget", "syok", "sukses",
+        "gagal", "ternyata", "bohong", "jujur", "beneran", "serius", "mustahil",
+        "luar biasa", "mantap", "gilaa", "wkwk", "hahaha", "haha", "astaga",
+        "aduh", "wow", "yah", "eh", "nggak nyangka", "tidak mungkin", "mengejutkan",
+        "kenapa", "bagaimana", "tahu gak", "pernah gak", "gawat", "bahaya",
+        "shock", "kocak", "epic", "akhirnya", "sebenarnya", "percaya", "terbukti",
+        "secret", "viral", "fail", "success", "shocking", "funny", "laugh",
+        "hack", "amazing", "crazy", "insane", "omg", "wait", "seriously",
+        "unbelievable", "no way", "finally", "actually", "believe", "truth",
+        "unexpected", "surprise", "incredible", "legendary", "goat"
+    ]
+
+    video_end = timed_cues[-1]['end'] if timed_cues else duration
+
+    # Sliding window scoring
+    window_scores = []
+    pos = timed_cues[0]['start']
+
+    while pos < video_end - window_sec * 0.4:
+        w_end = pos + window_sec
+        window_cues = [c for c in timed_cues if c['start'] >= pos and c['start'] < w_end]
+
+        if len(window_cues) < 2:
+            pos += step_sec
+            continue
+
+        full_text_lower = ' '.join(c['text'] for c in window_cues).lower()
+        orig_text = ' '.join(c['text'] for c in window_cues)
+        score = 0.0
+
+        # 1. Kepadatan kata emosional
+        word_hits = sum(1 for w in emotional_words if w in full_text_lower)
+        score += min(0.5, word_hits * 0.15)
+
+        # 2. Tanda baca emosional (?, !, ...)
+        score += min(0.3, full_text_lower.count('?') * 0.1)
+        score += min(0.3, full_text_lower.count('!') * 0.1)
+        score += min(0.1, full_text_lower.count('...') * 0.03)
+
+        # 3. Kecepatan bicara (cue per detik — tinggi = ekspresi intens)
+        time_span = window_cues[-1]['end'] - window_cues[0]['start']
+        if time_span > 0:
+            cues_per_sec = len(window_cues) / time_span
+            score += min(0.3, cues_per_sec * 0.08)
+
+        # 4. Ratio huruf kapital (menunjukkan ekspresi atau penekanan)
+        alpha_chars = [c for c in orig_text if c.isalpha()]
+        if alpha_chars:
+            upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+            score += min(0.2, upper_ratio * 0.4)
+
+        window_scores.append({
+            'start': pos,
+            'end': min(w_end, video_end),
+            'score': score,
+            'cue_count': len(window_cues)
+        })
+        pos += step_sec
+
+    if not window_scores:
+        return []
+
+    # Sort berdasarkan skor tertinggi
+    window_scores.sort(key=lambda x: x['score'], reverse=True)
+
+    # Non-maximum suppression: hapus window overlap > 40% dengan yang sudah terpilih
+    selected = []
+    for w in window_scores:
+        if w['score'] < 0.1:
+            continue
+        is_dup = False
+        for sel in selected:
+            ov_s = max(w['start'], sel['start'])
+            ov_e = min(w['end'], sel['end'])
+            if ov_e > ov_s and (ov_e - ov_s) / window_sec > 0.4:
+                is_dup = True
+                break
+        if not is_dup:
+            selected.append(w)
+        if len(selected) >= max_clips:
+            break
+
+    # Format sebagai clip
+    result = []
+    for i, w in enumerate(selected):
+        dur = w['end'] - w['start']
+        if dur < min_clip_dur:
+            center = (w['start'] + w['end']) / 2
+            w['start'] = max(0, center - min_clip_dur / 2)
+            w['end'] = min(duration, center + min_clip_dur / 2)
+        elif dur > max_clip_dur:
+            w['end'] = w['start'] + max_clip_dur
+        result.append({
+            'title': f"\U0001f4ac Momen Viral #{i + 1}",
+            'start_time': round(w['start'], 1),
+            'end_time': round(w['end'], 1),
+            'source': 'transcript',
+            'score': round(w['score'], 2)
+        })
+
+    result.sort(key=lambda x: x['start_time'])
+    return result
+
+
+def analyze_audio_energy(url, video_id, duration, max_clips=4, min_clip_dur=20, max_clip_dur=60):
+    """
+    Layer 4 — Download audio-only dari YouTube, lalu analisis energi RMS per 5 detik via FFmpeg.
+    Mencari zona audio paling ramai (peak energy) dan paling dinamis (high variance).
+    Hanya dijalankan jika video ≤ 40 menit dan layer 1-3 belum menghasilkan cukup clip.
+    """
+    # Lewati video terlalu panjang untuk efisiensi
+    if duration > 2400:
+        return []
+
+    base_audio_path = os.path.join(DOWNLOADS_DIR, f"audio_anl_{video_id}")
+
+    try:
+        # Bersihkan file audio lama jika ada
+        for old_f in glob.glob(base_audio_path + '.*'):
+            try:
+                os.remove(old_f)
+            except Exception:
+                pass
+
+        # Download audio-only (format paling kecil yang tersedia)
+        ydl_opts = {
+            'format': 'worstaudio/bestaudio',
+            'outtmpl': base_audio_path + '.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Temukan file audio yang berhasil diunduh
+        downloaded = glob.glob(base_audio_path + '.*')
+        if not downloaded:
+            return []
+        audio_path = downloaded[0]
+
+        # Konversi ke raw PCM float32 mono 8kHz via FFmpeg (pipe ke stdout)
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ar", "8000", "-ac", "1",
+            "-f", "f32le", "pipe:1"
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+
+        # Hitung RMS per 5 detik dalam Python
+        import struct
+        interval_sec = 5
+        sr = 8000
+        samples_per_interval = sr * interval_sec
+        bytes_per_interval = samples_per_interval * 4  # float32 = 4 bytes
+        raw_data = proc.stdout
+
+        rms_values = []
+        for i in range(0, len(raw_data) - bytes_per_interval + 1, bytes_per_interval):
+            chunk = raw_data[i:i + bytes_per_interval]
+            n = len(chunk) // 4
+            if n == 0:
+                continue
+            samples = struct.unpack(f'{n}f', chunk[:n * 4])
+            rms = (sum(s * s for s in samples) / n) ** 0.5
+            rms_values.append(rms)
+
+        if not rms_values or len(rms_values) < 6:
+            return []
+
+        # Normalize ke 0.0 – 1.0
+        min_rms = min(rms_values)
+        max_rms = max(rms_values)
+        rms_range = max_rms - min_rms
+        if rms_range < 0.005:  # Tidak ada variasi berarti
+            return []
+        norm = [(v - min_rms) / rms_range for v in rms_values]
+
+        # Sliding window (target ~30 detik, sesuaikan panjang video)
+        win_intervals = max(3, min(12, len(norm) // 4))  # window 15–60 detik
+        step_intervals = max(1, win_intervals // 3)
+
+        window_scores = []
+        for i in range(0, len(norm) - win_intervals + 1, step_intervals):
+            window = norm[i:i + win_intervals]
+            avg_energy = sum(window) / len(window)
+            mean_w = avg_energy
+            variance = sum((v - mean_w) ** 2 for v in window) / len(window)
+            # Score = energi rata-rata + dinamisme (variance tinggi = momen menarik)
+            combined = avg_energy * 0.55 + min(0.45, variance * 3.0)
+            window_scores.append({
+                'start': float(i * interval_sec),
+                'end': float((i + win_intervals) * interval_sec),
+                'score': combined,
+                'avg_energy': avg_energy
+            })
+
+        if not window_scores:
+            return []
+
+        window_scores.sort(key=lambda x: x['score'], reverse=True)
+
+        # Non-maximum suppression
+        win_dur = win_intervals * interval_sec
+        selected = []
+        for w in window_scores:
+            if w['avg_energy'] < 0.25:
+                continue
+            is_dup = False
+            for sel in selected:
+                ov_s = max(w['start'], sel['start'])
+                ov_e = min(w['end'], sel['end'])
+                if ov_e > ov_s and (ov_e - ov_s) / win_dur > 0.4:
+                    is_dup = True
+                    break
+            if not is_dup:
+                selected.append(w)
+            if len(selected) >= max_clips:
+                break
+
+        # Format sebagai clip
+        result_clips = []
+        for i, w in enumerate(selected):
+            start = min(w['start'], max(0.0, duration - min_clip_dur))
+            end = min(w['end'], duration)
+            dur = end - start
+            if dur < min_clip_dur:
+                center = (start + end) / 2
+                start = max(0, center - min_clip_dur / 2)
+                end = min(duration, center + min_clip_dur / 2)
+            elif dur > max_clip_dur:
+                end = start + max_clip_dur
+            result_clips.append({
+                'title': f"\U0001f3b5 Momen Energi #{i + 1}",
+                'start_time': round(start, 1),
+                'end_time': round(end, 1),
+                'source': 'audio_energy',
+                'score': round(w['score'], 2)
+            })
+
+        result_clips.sort(key=lambda x: x['start_time'])
+        return result_clips
+
+    except Exception:
+        return []
+    finally:
+        # Bersihkan semua file audio sementara
+        for f in glob.glob(base_audio_path + '.*'):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+
+def analyze_with_gemini(srt_content, duration, api_key, model="gemini-1.5-flash"):
+    """
+    Layer 0 (Prioritas Tertinggi) — Analisis kontekstual transcript menggunakan Google Gemini AI.
+    Memahami narasi, emosi, dan plot twist — bukan sekadar keyword matching.
+    Memerlukan Gemini API key (gratis di aistudio.google.com).
+    """
+    import requests as _req
+    import json as _json
+
+    if not api_key or not srt_content:
+        return []
+
+    # Batasi panjang transcript agar tidak melebihi token limit
+    transcript_trimmed = srt_content[:14000]
+
+    prompt = f"""Kamu adalah expert analisis konten YouTube yang sangat berpengalaman.
+Diberikan transcript/subtitle dari sebuah video YouTube, tugasmu adalah mengidentifikasi
+TOP 6 momen yang paling MENARIK, VIRAL, atau BERNILAI untuk dijadikan clip pendek.
+
+Kriteria momen yang baik untuk di-clip:
+- Punchline atau humor yang sangat lucu dan mengejutkan
+- Fakta mengejutkan, plot twist, atau revelasi penting
+- Puncak emosi (marah, haru, kagum, kaget yang autentik)
+- Insight atau penjelasan yang sangat valuable dan actionable
+- Konflik, perdebatan, atau drama yang menarik perhatian
+- Momen "hook" yang membuat penonton ingin share
+
+Aturan WAJIB:
+- Setiap clip minimal 20 detik, maksimal {min(int(duration), 90)} detik
+- Timestamps harus dalam format angka detik (contoh: 45.0, tidak "0:45")
+- JANGAN melampaui durasi video: {int(duration)} detik
+- Jika dua momen sangat berdekatan, ambil yang lebih menarik saja
+- title maksimal 50 karakter, reason maksimal 120 karakter
+- WAJIB: Sebar clip dari AWAL hingga AKHIR video! Minimal 1 clip dari:
+  * Bagian AWAL (0 - {int(duration/3)} detik)
+  * Bagian TENGAH ({int(duration/3)} - {int(duration*2/3)} detik)
+  * Bagian AKHIR ({int(duration*2/3)} - {int(duration)} detik)
+- JANGAN memilih semua clip dari satu bagian video saja
+
+Kembalikan HANYA JSON array berikut (tanpa teks, komentar, atau markdown apapun di luar array):
+[
+  {{
+    "start_time": 45.0,
+    "end_time": 105.0,
+    "title": "Judul singkat momen",
+    "reason": "Alasan momen ini viral atau penting untuk penonton"
+  }}
+]
+
+Transcript video (durasi total: {int(duration)} detik):
+{transcript_trimmed}"""
+
+    url_endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
+        f":generateContent?key={api_key}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 1024,
+        }
+    }
+
+    try:
+        resp = _req.post(url_endpoint, json=payload, timeout=45)
+        resp.raise_for_status()
+        resp_data = resp.json()
+
+        # Ekstrak teks dari response Gemini
+        raw_text = resp_data['candidates'][0]['content']['parts'][0]['text'].strip()
+
+        # Cari blok JSON di dalam response
+        json_start = raw_text.find('[')
+        json_end = raw_text.rfind(']') + 1
+        if json_start == -1 or json_end == 0:
+            return []
+
+        clips_raw = _json.loads(raw_text[json_start:json_end])
+        if not isinstance(clips_raw, list):
+            return []
+
+        result_clips = []
+        for i, c in enumerate(clips_raw[:6]):
+            try:
+                start = max(0.0, float(c.get('start_time', 0)))
+                end = min(float(duration), float(c.get('end_time', start + 30)))
+                if end - start < 10:  # Skip clip terlalu pendek
+                    continue
+                result_clips.append({
+                    'title': f"\U0001f916 {str(c.get('title', f'AI Clip #{i+1}'))[:50]}",
+                    'start_time': round(start, 1),
+                    'end_time': round(end, 1),
+                    'source': 'ai_gemini',
+                    'score': 0.95,
+                    'ai_reason': str(c.get('reason', ''))[:120]
+                })
+            except (ValueError, TypeError):
+                continue
+
+        result_clips.sort(key=lambda x: x['start_time'])
+        return result_clips
+
+    except Exception:
+        return []
+
+
 def analyze_clip_transcript(srt_path, start_time, end_time):
     """
     Menganalisis teks subtitle dalam rentang waktu tertentu.
@@ -768,18 +1206,32 @@ def calculate_viral_score(clip, srt_path=None):
     Menghitung skor potensi viral berdasarkan sumber deteksi dan analisis teks.
     """
     base_scores = {
+        'ai_gemini': 0.92,
         'heatmap': 0.75,
         'chapter': 0.65,
+        'transcript': 0.60,
+        'audio_energy': 0.55,
         'auto': 0.40
     }
     score = base_scores.get(clip['source'], 0.50)
     reasons = []
-    
-    if clip['source'] == 'heatmap':
+
+    if clip['source'] == 'ai_gemini':
+        reasons.append("\U0001f916 Momen diidentifikasi oleh Gemini AI secara kontekstual")
+        ai_reason = clip.get('ai_reason', '')
+        if ai_reason:
+            reasons.append(f"\U0001f4a1 {ai_reason}")
+    elif clip['source'] == 'heatmap':
         score += min(0.15, clip.get('score', 0.0) * 0.1)
         reasons.append("🔥 Momen paling sering diputar penonton (Most Replayed)")
     elif clip['source'] == 'chapter':
         reasons.append("📖 Bagian dari bab/chapter video yang terstruktur")
+    elif clip['source'] == 'transcript':
+        score += min(0.10, clip.get('score', 0.0) * 0.1)
+        reasons.append("💬 Terdeteksi lonjakan kata emosional & kecepatan bicara tinggi")
+    elif clip['source'] == 'audio_energy':
+        score += min(0.10, clip.get('score', 0.0) * 0.1)
+        reasons.append("🎵 Terdeteksi zona energi audio paling ramai/dinamis")
     else:
         reasons.append("✂️ Pembagian segmen otomatis durasi ideal")
         
@@ -798,18 +1250,33 @@ def calculate_viral_score(clip, srt_path=None):
     return int(round(final_score * 100)), reasons
 
 
-def detect_highlights(metadata, target_dur=60, srt_path=None):
+def detect_highlights(metadata, target_dur=60, srt_path=None, url=None,
+                      gemini_api_key=None, gemini_model="gemini-1.5-flash"):
     """
-    Menggabungkan semua sumber deteksi momen menarik:
+    Menggabungkan semua sumber deteksi momen menarik (6 layer):
+    0. Gemini AI Analysis — kontekstual, paling akurat (jika API key tersedia)
     1. YouTube Chapters (jika ada)
     2. Most Replayed / Heatmap peaks (jika ada)
-    3. Fallback: bagi rata per target_dur detik (jika tidak ada sumber lain)
+    3. Transcript Analysis — sliding window kata emosional
+    4. Audio Energy Detection via FFmpeg
+    5. Fallback: bagi rata per target_dur detik (jika tidak ada sumber lain)
     Mengisi data viral_score dan viral_reasons pada tiap klip.
     """
     clips = []
     duration = metadata['duration']
+    video_id = metadata.get('id', '')
 
-    # 1. Chapters
+    # Layer 0: Gemini AI Analysis (prioritas TERTINGGI — jika API key tersedia + ada subtitle)
+    if gemini_api_key and srt_path and os.path.exists(srt_path):
+        try:
+            with open(srt_path, 'r', encoding='utf-8', errors='ignore') as _f:
+                srt_for_ai = _f.read()
+            ai_clips = analyze_with_gemini(srt_for_ai, duration, gemini_api_key, gemini_model)
+            clips.extend(ai_clips)
+        except Exception:
+            pass
+
+    # Layer 1: Chapters
     for ch in metadata.get('chapters', []):
         dur = ch['end_time'] - ch['start_time']
         if dur > 3:  # Skip chapter < 3 detik
@@ -823,7 +1290,7 @@ def detect_highlights(metadata, target_dur=60, srt_path=None):
 
     # 2. Heatmap peaks
     heatmap_clips = parse_heatmap_peaks(metadata.get('heatmap', []), duration, max_clip_dur=target_dur)
-    
+
     # Deduplikasi: jangan tambah heatmap clip yang terlalu overlap dengan chapter
     for hc in heatmap_clips:
         is_duplicate = False
@@ -839,7 +1306,48 @@ def detect_highlights(metadata, target_dur=60, srt_path=None):
         if not is_duplicate:
             clips.append(hc)
 
-    # 3. Fallback: bagi rata jika tidak ada clip terdeteksi
+    # 3. Transcript/Subtitle Analysis — aktif jika clip < 3 ATAU ada gap zona besar yang belum tercakup
+    if srt_path:
+        gaps = _find_coverage_gaps(clips, duration, min_gap_sec=max(60, duration * 0.2))
+        if len(clips) < 3 or gaps:
+            transcript_clips = analyze_transcript_highlights(
+                srt_path, duration, max_clips=6, max_clip_dur=target_dur
+            )
+            for tc in transcript_clips:
+                is_dup = False
+                for ex in clips:
+                    ov_s = max(tc['start_time'], ex['start_time'])
+                    ov_e = min(tc['end_time'], ex['end_time'])
+                    tc_dur = tc['end_time'] - tc['start_time']
+                    if ov_e > ov_s and tc_dur > 0 and (ov_e - ov_s) / tc_dur > 0.4:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    clips.append(tc)
+
+    # 4. Audio Energy Detection — aktif jika clip < 2 ATAU masih ada gap zona besar
+    if url and video_id:
+        gaps = _find_coverage_gaps(clips, duration, min_gap_sec=max(60, duration * 0.2))
+        if len(clips) < 2 or gaps:
+            audio_clips = analyze_audio_energy(
+                url, video_id, duration, max_clips=6, max_clip_dur=target_dur
+            )
+            for ac in audio_clips:
+                is_dup = False
+                for ex in clips:
+                    ov_s = max(ac['start_time'], ex['start_time'])
+                    ov_e = min(ac['end_time'], ex['end_time'])
+                    ac_dur = ac['end_time'] - ac['start_time']
+                    if ov_e > ov_s and ac_dur > 0 and (ov_e - ov_s) / ac_dur > 0.4:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    clips.append(ac)
+
+    # 5. Fallback coverage: isi zona awal/tengah/akhir yang masih kosong
+    clips = _fill_coverage_gaps(clips, duration, target_dur)
+
+    # 6. Fallback total: bagi rata jika tidak ada clip sama sekali
     if not clips:
         clip_dur = target_dur
         pos = 0.0
@@ -857,17 +1365,139 @@ def detect_highlights(metadata, target_dur=60, srt_path=None):
                 idx += 1
             pos = end
 
-    # Tambahkan skor viral dan penjelasan
+    # Tambahkan skor viral dan penjelasan ke tiap klip
     for clip in clips:
         score, reasons = calculate_viral_score(clip, srt_path)
         clip['viral_score'] = score
         clip['viral_reasons'] = reasons
 
-    # Sort berdasarkan waktu
+    # Sort berdasarkan waktu mulai
     clips.sort(key=lambda x: x['start_time'])
 
-    # Limit ke 8 clip maksimal
-    return clips[:8]
+    # Limit ke 8 clip, pastikan mencakup awal/tengah/akhir video
+    return _select_clips_with_coverage(clips, duration, max_clips=8)
+
+
+def _find_coverage_gaps(clips, duration, min_gap_sec=60):
+    """
+    Temukan zona waktu dalam video yang belum tercakup oleh clip manapun.
+    Kembalikan list of (gap_start, gap_end) yang melebihi min_gap_sec.
+    """
+    if not clips:
+        return [(0.0, duration)]
+
+    sorted_clips = sorted(clips, key=lambda x: x['start_time'])
+    gaps = []
+
+    # Gap di awal video
+    if sorted_clips[0]['start_time'] > min_gap_sec:
+        gaps.append((0.0, sorted_clips[0]['start_time']))
+
+    # Gap antar clip
+    for i in range(len(sorted_clips) - 1):
+        gap_start = sorted_clips[i]['end_time']
+        gap_end = sorted_clips[i + 1]['start_time']
+        if gap_end - gap_start > min_gap_sec:
+            gaps.append((gap_start, gap_end))
+
+    # Gap di akhir video
+    if duration - sorted_clips[-1]['end_time'] > min_gap_sec:
+        gaps.append((sorted_clips[-1]['end_time'], duration))
+
+    return gaps
+
+
+def _fill_coverage_gaps(clips, duration, target_dur):
+    """
+    Pastikan ada minimal 1 clip dari zona awal (0-33%), tengah (33-67%), dan akhir (67-100%).
+    Isi zona kosong dengan segmen otomatis bertanda 'auto'.
+    """
+    if duration < 30:
+        return clips
+
+    third = duration / 3
+    zones = [
+        ('awal',   0.0,       third,       '⏮️ Pembuka Video'),
+        ('tengah', third,     third * 2,   '🎯 Inti Video'),
+        ('akhir',  third * 2, duration,    '🏁 Penutup Video'),
+    ]
+
+    result = list(clips)
+
+    for zone_name, z_start, z_end, zone_label in zones:
+        # Cek apakah zona ini sudah punya clip
+        has_coverage = any(
+            c['start_time'] < z_end and c['end_time'] > z_start
+            for c in result
+        )
+        if has_coverage:
+            continue
+
+        # Pilih tengah zona sebagai pusat clip baru
+        center = (z_start + z_end) / 2
+        clip_start = max(0.0, center - target_dur / 2)
+        clip_end = min(duration, clip_start + target_dur)
+
+        # Pastikan tidak terlalu overlap dengan clip yang ada
+        is_dup = False
+        for ex in result:
+            ov_s = max(clip_start, ex['start_time'])
+            ov_e = min(clip_end, ex['end_time'])
+            clip_d = clip_end - clip_start
+            if ov_e > ov_s and clip_d > 0 and (ov_e - ov_s) / clip_d > 0.5:
+                is_dup = True
+                break
+
+        if not is_dup and clip_end - clip_start >= 10:
+            result.append({
+                'title': f"✂️ {zone_label}",
+                'start_time': round(clip_start, 1),
+                'end_time': round(clip_end, 1),
+                'source': 'auto',
+                'score': 0.5
+            })
+
+    return result
+
+
+def _select_clips_with_coverage(clips, duration, max_clips=8):
+    """
+    Pilih hingga max_clips clip dengan distribusi merata dari awal, tengah, dan akhir video.
+    Bukan sekadar ambil 8 dengan skor tertinggi — pastikan semua bagian video terwakili.
+    """
+    if len(clips) <= max_clips:
+        return clips
+
+    third = duration / 3
+    early  = [c for c in clips if c['start_time'] < third]
+    middle = [c for c in clips if third <= c['start_time'] < third * 2]
+    late   = [c for c in clips if c['start_time'] >= third * 2]
+
+    selected = []
+    quota_each = max(1, max_clips // 3)
+
+    # Ambil clip terbaik dari tiap zona
+    for zone_clips in [early, middle, late]:
+        zone_sorted = sorted(
+            zone_clips,
+            key=lambda x: x.get('viral_score', x.get('score', 0)),
+            reverse=True
+        )
+        selected.extend(zone_sorted[:quota_each])
+
+    # Isi sisa slot dengan clip terbaik yang belum terpilih
+    remaining_slots = max_clips - len(selected)
+    if remaining_slots > 0:
+        already_ids = set(id(c) for c in selected)
+        leftover = sorted(
+            [c for c in clips if id(c) not in already_ids],
+            key=lambda x: x.get('viral_score', x.get('score', 0)),
+            reverse=True
+        )
+        selected.extend(leftover[:remaining_slots])
+
+    selected.sort(key=lambda x: x['start_time'])
+    return selected
 
 
 def convert_srt_to_ass(srt_path, ass_path, cfg):
@@ -1047,7 +1677,7 @@ def download_subtitles(url, video_id, lang='id'):
         try: os.remove(old_file)
         except Exception: pass
 
-    ydl_opts = get_ydl_opts({
+    ydl_opts = {
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -1059,7 +1689,7 @@ def download_subtitles(url, video_id, lang='id'):
             'key': 'FFmpegSubtitlesConvertor',
             'format': 'srt',
         }],
-    })
+    }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -1359,13 +1989,13 @@ def download_video_clip(url, start_sec, end_sec, video_id, quality="480p"):
             with open(lock_path, "w") as f:
                 f.write("locked")
                 
-            ydl_opts = get_ydl_opts({
+            ydl_opts = {
                 'format': fmt_map.get(quality, fmt_map["480p"]),
                 'outtmpl': full_video_path,
                 'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
-            })
+            }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         finally:
@@ -1661,28 +2291,12 @@ with st.sidebar:
                 sub_color_hex = "&H00FFFFFF"
                 sub_outline_hex = "&H00000000"
 
-    # === COOKIES YOUTUBE ===
-    st.markdown('<div class="sidebar-section-title">🍪 COOKIES YOUTUBE</div>', unsafe_allow_html=True)
-    st.caption("Unggah cookies.txt jika Anda menemui error 403 (Forbidden).")
-    uploaded_cookie = st.file_uploader(
-        "Unggah cookies.txt",
-        type=["txt"],
-        help="Ekspor cookies YouTube dari browser Anda menggunakan ekstensi (seperti 'Get cookies.txt LOCALLY') lalu unggah di sini."
-    )
-
-    if uploaded_cookie:
-        cookie_path = os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")
-        try:
-            with open(cookie_path, "wb") as f:
-                f.write(uploaded_cookie.getbuffer())
-            st.success("✅ Cookies aktif!")
-        except Exception:
-            st.error("Gagal menyimpan cookies.")
-    elif os.path.exists(os.path.join(DOWNLOADS_DIR, "yt_cookies.txt")):
-        st.success("✅ Cookies aktif (tersimpan)!")
+    st.markdown("---")
+    st.markdown('<div class="sidebar-section-title">🤖 ANALISIS AI</div>', unsafe_allow_html=True)
+    st.success("✅ Gemini AI aktif otomatis")
 
     st.markdown("---")
-    st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit · yt-dlp · FFmpeg</div></div>', unsafe_allow_html=True)
+    st.markdown('<div style="text-align:center;padding:6px 0;"><div style="font-size:0.68rem;color:#4b5563;">Streamlit \u00b7 yt-dlp \u00b7 FFmpeg</div></div>', unsafe_allow_html=True)
 
 
 # ==============================================================================
@@ -1745,6 +2359,7 @@ if btn_go and url_input.strip():
         st.session_state['clip_configs'] = {}
         st.session_state['clip_srt_cues'] = {}
         st.session_state['preview_clip_index'] = 0
+        st.session_state['_clips_target_dur'] = None  # Reset cache dur
         st.session_state['current_url'] = url_input
 
     with st.spinner("🔍 Menganalisis video & mendeteksi momen menarik…"):
@@ -1769,9 +2384,15 @@ if btn_go and url_input.strip():
                 except Exception:
                     st.session_state['subtitle_path'] = None
 
-        # 2. Deteksi highlights dengan menyertakan srt_path agar dapat menganalisis transkrip secara mendalam
-        clips = detect_highlights(result, target_clip_dur, srt_path)
+        # 2. Deteksi highlights — 6-layer analisis cerdas (AI→chapters→heatmap→transkrip→energi audio→fallback)
+        with st.spinner("🧠 Menganalisis momen viral secara mendalam… 🤖 Gemini AI aktif"):
+            clips = detect_highlights(
+                result, target_clip_dur, srt_path, url=url_input,
+                gemini_api_key=GEMINI_API_KEY,
+                gemini_model=GEMINI_MODEL
+            )
         st.session_state['clips'] = clips
+        st.session_state['_clips_target_dur'] = target_clip_dur  # Simpan dur yang dipakai
         st.session_state['selected_clips'] = {i: True for i in range(len(clips))}
 
         # 3. Urutkan klip berdasarkan skor potensi viral tertinggi untuk menentukan klip yang akan dipotong otomatis
@@ -1902,8 +2523,19 @@ elif btn_go and not url_input.strip():
 
 if st.session_state['video_metadata']:
     meta = st.session_state['video_metadata']
-    clips = detect_highlights(meta, target_clip_dur, st.session_state.get('subtitle_path'))
-    st.session_state['clips'] = clips
+    cached_target = st.session_state.get('_clips_target_dur')
+    # Hanya re-detect jika target_dur berubah dari sidebar ATAU clips belum ada.
+    # Jangan jalankan audio analysis (url=None) di sini agar tidak download audio
+    # setiap kali Streamlit me-render ulang halaman.
+    if not st.session_state.get('clips') or cached_target != target_clip_dur:
+        clips = detect_highlights(
+            meta, target_clip_dur,
+            st.session_state.get('subtitle_path')
+            # url tidak diteruskan — audio analysis hanya pada saat tombol ditekan
+        )
+        st.session_state['clips'] = clips
+        st.session_state['_clips_target_dur'] = target_clip_dur
+    clips = st.session_state.get('clips', [])
     for i in range(len(clips)):
         if i not in st.session_state['selected_clips']:
             st.session_state['selected_clips'][i] = True
@@ -1961,12 +2593,18 @@ if st.session_state['video_metadata']:
             
             # Tampilkan Skor Potensi Viral
             if clip:
-                score_color = "#f43f5e" if clip.get('viral_score', 0) >= 75 else "#c084fc"
+                is_ai = clip.get('source') == 'ai_gemini'
+                score_color = "#a78bfa" if is_ai else ("#f43f5e" if clip.get('viral_score', 0) >= 75 else "#c084fc")
+                ai_badge = (
+                    "<span style='background:#7c3aed;color:#fff;font-size:0.6rem;padding:2px 7px;"
+                    "border-radius:99px;font-weight:700;margin-left:6px;'>\U0001f916 AI</span>"
+                    if is_ai else ""
+                )
                 score_bar_html = f"""
                 <div style='background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px; margin-bottom: 12px;'>
                     <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;'>
-                        <span style='font-size: 0.8rem; font-weight: 600; color: #d1d5db;'>⚡ Potensi Viral</span>
-                        <span style='font-size: 0.95rem; font-weight: 800; color: {score_color};'>🔥 {clip.get('viral_score', 0)}%</span>
+                        <span style='font-size: 0.8rem; font-weight: 600; color: #d1d5db;'>\u26a1 Potensi Viral{ai_badge}</span>
+                        <span style='font-size: 0.95rem; font-weight: 800; color: {score_color};'>\U0001f525 {clip.get('viral_score', 0)}%</span>
                     </div>
                     <div style='background: rgba(255,255,255,0.05); height: 6px; border-radius: 3px; overflow: hidden;'>
                         <div style='background: {score_color}; width: {clip.get('viral_score', 0)}%; height: 100%; border-radius: 3px;'></div>
@@ -1988,14 +2626,31 @@ if st.session_state['video_metadata']:
 
                 st.video(video_data)
 
+                # Generate caption dan tags terlebih dahulu
+                srt_str = st.session_state['clip_srts'].get(clip_idx, "")
+                suggested_caption, suggested_tags = generate_social_suggestions(clip, meta, srt_str)
+
+                # Buat nama file video berdasarkan saran caption yang bersih dari karakter ilegal
+                import re
+                clean_filename = re.sub(r'[^\w\s-]', '', suggested_caption)
+                clean_filename = re.sub(r'[-\s]+', '_', clean_filename).strip('_')
+                if not clean_filename:
+                    clean_filename = f"clipper_{meta['id']}_{clip_idx}"
+                else:
+                    clean_filename = clean_filename[:80]  # batasi panjang nama file
+
                 st.download_button(
                     label=f"📥 Unduh — {clip_title}",
                     data=video_data,
-                    file_name=f"clipper_{meta['id']}_{clip_idx}.mp4",
+                    file_name=f"{clean_filename}.mp4",
                     mime="video/mp4",
                     use_container_width=True,
                     key=f"dl_{clip_idx}"
                 )
+
+                st.markdown("<div style='margin-top: 14px; margin-bottom: 4px; font-size: 0.82rem; font-weight: 700; color: #a78bfa;'>📱 Caption & Hashtags Media Sosial:</div>", unsafe_allow_html=True)
+                st.text_area("Saran Caption", value=suggested_caption, key=f"caption_{clip_idx}", height=65, label_visibility="collapsed")
+                st.text_input("Saran Hashtag", value=suggested_tags, key=f"tags_{clip_idx}", label_visibility="collapsed")
 
             with col_edt:
                 with st.expander(f"✏️ Edit Klip & Subtitle", expanded=False):
